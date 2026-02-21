@@ -1,0 +1,54 @@
+# golangci-lint configuration for Grafophone
+# Ref: SPECS.md — CI/CD Pipeline Specifications — Stage 1: Lint & Static Analysis
+
+run:
+  timeout: 5m
+  go: "1.23"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - gosimple
+    - unused
+    - ineffassign
+    - typecheck
+    - gocritic
+    - revive
+    - gofumpt
+    - misspell
+    - bodyclose
+    - noctx
+    - exhaustive
+    - gosec
+    - prealloc
+
+linters-settings:
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - style
+      - performance
+  revive:
+    rules:
+      - name: blank-imports
+      - name: context-as-argument
+      - name: dot-imports
+      - name: error-return
+      - name: error-strings
+      - name: exported
+      - name: increment-decrement
+      - name: var-naming
+      - name: package-comments
+        disabled: true   # allow packages without doc comments during early dev
+  gosec:
+    excludes:
+      - G104   # allow unhandled errors in deferred Close() calls
+  exhaustive:
+    default-signifies-exhaustive: true
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0

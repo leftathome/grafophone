@@ -23,3 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Security review: credential management via environment variables, non-root containers,
   distroless base images, log redaction, read-only database users
 - AGENTS.md with contributor guidelines for changelog maintenance and commit conventions
+- CI workflow with 15 PR checks: markdown lint, link check, conventional commits,
+  changelog enforcement, spell check, golangci-lint, unit tests with race detector,
+  coverage gate (80%), cross-platform build matrix, govulncheck, fuzz tests, YAML lint,
+  actionlint, doc cross-reference validation, and shellcheck

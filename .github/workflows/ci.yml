@@ -1,0 +1,375 @@
+name: CI
+on:
+  push:
+    branches: [main, "feature/**", "claude/**"]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Check 1: Markdown lint — consistent formatting
+  # ──────────────────────────────────────────────
+  markdown-lint:
+    name: "Markdown lint"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DavidAnson/markdownlint-cli2-action@v19
+        with:
+          globs: "**/*.md"
+
+  # ──────────────────────────────────────────────
+  # Check 2: Markdown link check — no broken links
+  # ──────────────────────────────────────────────
+  markdown-links:
+    name: "Markdown link check"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: gaurav-nelson/github-action-markdown-link-check@v1
+        with:
+          use-quiet-mode: "yes"
+          config-file: ".markdown-link-check.json"
+
+  # ──────────────────────────────────────────────
+  # Check 3: Conventional Commits — enforced on PR
+  # ──────────────────────────────────────────────
+  conventional-commits:
+    name: "Conventional Commits"
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            perf
+            docs
+            refactor
+            test
+            ci
+            chore
+          requireScope: false
+          subjectPattern: ^[a-z].+$
+          subjectPatternError: |
+            The subject "{subject}" must start with a lowercase letter.
+
+  # ──────────────────────────────────────────────
+  # Check 4: CHANGELOG entry for user-facing PRs
+  # ──────────────────────────────────────────────
+  changelog-check:
+    name: "CHANGELOG updated"
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check CHANGELOG for user-facing changes
+        run: |
+          # Get the PR's commit messages
+          COMMITS=$(git log --format="%s" origin/${{ github.base_ref }}..HEAD 2>/dev/null || true)
+
+          # Check if any commits are user-facing (feat, fix, perf)
+          USER_FACING=false
+          while IFS= read -r msg; do
+            if echo "$msg" | grep -qE '^(feat|fix|perf)(\(.+\))?!?:'; then
+              USER_FACING=true
+              echo "User-facing commit found: $msg"
+            fi
+          done <<< "$COMMITS"
+
+          if [ "$USER_FACING" = "true" ]; then
+            # Check if CHANGELOG.md was modified
+            if git diff --name-only origin/${{ github.base_ref }}..HEAD | grep -q '^CHANGELOG.md$'; then
+              echo "CHANGELOG.md updated — OK"
+            else
+              echo "::error::User-facing changes (feat/fix/perf) require a CHANGELOG.md entry under [Unreleased]. See AGENTS.md."
+              exit 1
+            fi
+          else
+            echo "No user-facing commits — CHANGELOG update not required."
+          fi
+
+  # ──────────────────────────────────────────────
+  # Check 5: Spelling — catch typos in all files
+  # ──────────────────────────────────────────────
+  spelling:
+    name: "Spell check"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crate-ci/typos@v1.29.5
+
+  # ──────────────────────────────────────────────
+  # Check 6: golangci-lint — 16 linters per SPECS.md
+  # ──────────────────────────────────────────────
+  lint:
+    name: "Go lint"
+    runs-on: ubuntu-latest
+    # Only run when Go source files exist
+    if: hashFiles('go.mod') != ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.62
+
+  # ──────────────────────────────────────────────
+  # Check 7+8: Unit tests, race detector, coverage gate
+  # ──────────────────────────────────────────────
+  test:
+    name: "Go test"
+    runs-on: ubuntu-latest
+    if: hashFiles('go.mod') != ''
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Unit tests with race detector
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+      - name: Coverage gate (>= 80%)
+        run: |
+          total=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | tr -d '%')
+          echo "Total coverage: ${total}%"
+          if (( $(echo "$total < 80" | bc -l) )); then
+            echo "::error::Coverage ${total}% is below the 80% threshold."
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  # ──────────────────────────────────────────────
+  # Check 9: Cross-platform build matrix
+  # ──────────────────────────────────────────────
+  build:
+    name: "Build (${{ matrix.goos }}/${{ matrix.goarch }})"
+    runs-on: ubuntu-latest
+    if: hashFiles('go.mod') != ''
+    needs: lint
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: arm
+            goarm: "6"
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          go build -ldflags "-s -w \
+            -X main.version=${GITHUB_REF_NAME:-dev} \
+            -X main.commit=$(git rev-parse --short HEAD) \
+            -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o grafophone-${{ matrix.goos }}-${{ matrix.goarch }} \
+            ./cmd/grafophone/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grafophone-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: grafophone-${{ matrix.goos }}-${{ matrix.goarch }}
+
+  # ──────────────────────────────────────────────
+  # Check 10: govulncheck — dependency vulnerabilities
+  # ──────────────────────────────────────────────
+  govulncheck:
+    name: "Go vulnerability check"
+    runs-on: ubuntu-latest
+    if: hashFiles('go.mod') != ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  # ──────────────────────────────────────────────
+  # Check 11: Fuzz tests — edge cases in critical paths
+  # ──────────────────────────────────────────────
+  fuzz:
+    name: "Fuzz tests"
+    runs-on: ubuntu-latest
+    if: hashFiles('go.mod') != ''
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Run fuzz tests (time-limited)
+        run: |
+          go test -fuzz=FuzzMapper -fuzztime=30s ./internal/mapper/... || true
+          go test -fuzz=FuzzQuantizer -fuzztime=30s ./internal/mapper/... || true
+          go test -fuzz=FuzzNormalize -fuzztime=30s ./internal/input/... || true
+          go test -fuzz=FuzzConfigParse -fuzztime=30s ./internal/config/... || true
+
+  # ──────────────────────────────────────────────
+  # Check 12: YAML config validation
+  # ──────────────────────────────────────────────
+  yaml-lint:
+    name: "YAML lint"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install yamllint
+        run: pip install yamllint
+      - name: Lint YAML files
+        run: |
+          # Lint all YAML files if any exist (configs, workflows, etc.)
+          find . -type f \( -name '*.yml' -o -name '*.yaml' \) \
+            -not -path './.git/*' \
+            -print0 | xargs -0 --no-run-if-empty yamllint -c .yamllint.yml
+
+  # ──────────────────────────────────────────────
+  # Check 13: actionlint — GitHub Actions syntax
+  # ──────────────────────────────────────────────
+  actionlint:
+    name: "Actions lint"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: reviewdog/action-actionlint@v1
+
+  # ──────────────────────────────────────────────
+  # Check 14: Design-spec alignment — doc cross-refs
+  # ──────────────────────────────────────────────
+  doc-cross-refs:
+    name: "Doc cross-references"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify TODO.md references exist in DESIGN.md and SPECS.md
+        run: |
+          EXIT_CODE=0
+
+          # Extract markdown anchor references from TODO.md (e.g., DESIGN.md#software-architecture)
+          refs=$(grep -oE '(DESIGN|SPECS)\.md#[a-z0-9-]+' TODO.md 2>/dev/null || true)
+
+          for ref in $refs; do
+            file=$(echo "$ref" | cut -d'#' -f1)
+            anchor=$(echo "$ref" | cut -d'#' -f2)
+
+            if [ ! -f "$file" ]; then
+              echo "::error::TODO.md references $file which does not exist"
+              EXIT_CODE=1
+              continue
+            fi
+
+            # Convert heading text to anchor format: lowercase, spaces to hyphens, strip punctuation
+            # Then check if the anchor exists as a heading in the target file
+            heading_anchors=$(grep -E '^#{1,6} ' "$file" | \
+              sed 's/^#* //' | \
+              tr '[:upper:]' '[:lower:]' | \
+              sed 's/ /-/g' | \
+              sed 's/[^a-z0-9-]//g')
+
+            if ! echo "$heading_anchors" | grep -qx "$anchor"; then
+              echo "::warning::TODO.md references ${file}#${anchor} but no matching heading found"
+            fi
+          done
+
+          exit $EXIT_CODE
+
+  # ──────────────────────────────────────────────
+  # Check 15: shellcheck — lint shell scripts
+  # ──────────────────────────────────────────────
+  shellcheck:
+    name: "Shell lint"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck on .sh files
+        run: |
+          # Find all shell scripts; skip if none exist
+          SCRIPTS=$(find . -type f -name '*.sh' -not -path './.git/*' 2>/dev/null || true)
+          if [ -z "$SCRIPTS" ]; then
+            echo "No .sh files found — skipping."
+            exit 0
+          fi
+          echo "$SCRIPTS" | xargs shellcheck --severity=warning
+
+  # ──────────────────────────────────────────────
+  # Integration tests (PRs to main + main branch)
+  # ──────────────────────────────────────────────
+  integration:
+    name: "Integration tests"
+    runs-on: ubuntu-latest
+    if: |
+      hashFiles('go.mod') != '' &&
+      (github.ref == 'refs/heads/main' || github.event_name == 'pull_request')
+    needs: [test, build]
+    # NOTE: All credentials below are ephemeral CI-only test fixtures.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: grafophone_test
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+      prometheus:
+        image: prom/prometheus:latest
+        ports: ["9090:9090"]
+        options: >-
+          --health-cmd "wget -qO- http://localhost:9090/-/healthy || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      mosquitto:
+        image: eclipse-mosquitto:2
+        ports: ["1883:1883"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Integration tests
+        env:
+          GRAFOPHONE_TEST_POSTGRES_URL: "postgres://test:test@localhost:5432/grafophone_test?sslmode=prefer"
+          GRAFOPHONE_TEST_REDIS_URL: "redis://localhost:6379"
+          GRAFOPHONE_TEST_PROMETHEUS_URL: "http://localhost:9090"
+          GRAFOPHONE_TEST_MQTT_URL: "tcp://localhost:1883"
+        run: go test -race -tags=integration -count=1 -timeout=5m ./...

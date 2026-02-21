@@ -1,0 +1,23 @@
+# Markdownlint configuration for Grafophone
+# See: https://github.com/DavidAnson/markdownlint/blob/main/doc/Rules.md
+
+default: true
+
+# Allow long lines — design docs have wide tables and code blocks
+MD013: false
+
+# Allow multiple top-level headings — each .md file is self-contained
+MD025: false
+
+# Allow inline HTML — used for anchor targets in DESIGN.md
+MD033: false
+
+# Allow bare URLs — common in reference sections
+MD034: false
+
+# Allow duplicate headings in different sections (e.g., "Exit criteria" under each task)
+MD024:
+  siblings_only: true
+
+# Allow trailing punctuation in headings (e.g., "What It Catches")
+MD026: false

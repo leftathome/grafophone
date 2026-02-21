@@ -1,0 +1,32 @@
+# typos configuration for Grafophone
+# See: https://github.com/crate-ci/typos
+
+[default]
+# Check both identifiers and comments/strings
+check-filename = true
+check-file = true
+
+[default.extend-words]
+# Domain-specific terms that are not typos
+# Hardware part numbers
+mcp = "mcp"
+dac = "dac"
+imu = "imu"
+# Music terms
+vel = "vel"
+bpm = "bpm"
+ppq = "ppq"
+osc = "osc"
+# Protocol terms
+mqtt = "mqtt"
+otel = "otel"
+grpc = "grpc"
+otlp = "otlp"
+
+[files]
+# Skip generated and binary files
+extend-exclude = [
+  "*.sum",
+  "vendor/**",
+  ".git/**",
+]

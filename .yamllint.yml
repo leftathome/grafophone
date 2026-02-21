@@ -1,0 +1,23 @@
+# yamllint configuration for Grafophone
+extends: default
+
+rules:
+  # Allow long lines in YAML (workflow files have long run: blocks)
+  line-length: disable
+  # Require consistent indentation
+  indentation:
+    spaces: 2
+  # Allow truthy values used by GitHub Actions (on:, yes/no)
+  truthy:
+    allowed-values: ["true", "false", "yes", "no"]
+    check-keys: false
+  # Allow empty values (used in GitHub Actions env: blocks)
+  empty-values:
+    forbid-in-block-mappings: false
+    forbid-in-flow-mappings: false
+  # Don't require document start marker
+  document-start: disable
+  # Allow comments without space (pragmas like #!)
+  comments:
+    require-starting-space: true
+    min-spaces-from-content: 1
