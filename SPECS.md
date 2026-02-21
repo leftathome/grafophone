@@ -991,7 +991,7 @@ nfpms:
     homepage: https://github.com/leftathome/grafophone
     maintainer: Grafophone Contributors
     description: Sensor-to-synthesizer sequencer
-    license: TBD
+    license: MIT
     formats:
       - deb
     contents:

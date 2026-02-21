@@ -84,4 +84,4 @@ make integration # run integration tests (requires Docker)
 
 ## License
 
-TBD
+[MIT](LICENSE)
