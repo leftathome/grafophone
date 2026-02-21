@@ -99,6 +99,52 @@ Backwards-compatibility guarantees begin at `v1.0.0`. Before that, minor version
    ```
 4. GoReleaser (via GitHub Actions) handles building, packaging, and publishing automatically.
 
+## Development Workflow
+
+### Design Before Code
+
+**Never implement anything that hasn't been designed and specified first.** Every coding task must trace back to an existing section in [DESIGN.md](DESIGN.md) or [SPECS.md](SPECS.md). If the feature or behavior isn't described there, write the design first and get it reviewed before writing any implementation code.
+
+### Task Sizing
+
+Keep all coding tasks as **small and simple as possible**. A single task should:
+
+- Touch one concern (one adapter, one interface, one module)
+- Be completable in a single focused session
+- Produce a diff that's easy to review in its entirety
+
+If a task feels large, break it down further before starting.
+
+### Red-to-Green TDD
+
+All implementation work follows strict test-driven development:
+
+1. **Red** — Write a failing test that describes the desired behavior. Run it; confirm it fails for the expected reason.
+2. **Green** — Write the minimum production code needed to make the test pass. No more.
+3. **Refactor** — Clean up the implementation while keeping tests green. Remove duplication, improve names, simplify structure.
+
+Repeat for each incremental behavior. Tests must pass before any commit is created.
+
+### Code Review Before PR
+
+Every set of changes must be **reviewed by a separate agent** before being submitted as a pull request. The review agent should verify:
+
+- Tests exist and cover the new behavior
+- The implementation matches the design/spec
+- No unnecessary complexity, over-engineering, or scope creep
+- Conventional Commits format is followed
+- CHANGELOG.md is updated if the change is user-facing
+
+Do **not** open a PR until the review agent has approved the changes.
+
+### Task Tracking
+
+The project maintains a `TODO.md` file in the repository root to track implementation tasks. Each task should reference the relevant section of DESIGN.md or SPECS.md. Mark tasks with status:
+
+- `[ ]` — not started
+- `[~]` — in progress
+- `[x]` — complete
+
 ## Code Review
 
 - All changes to `main` go through pull requests.

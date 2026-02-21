@@ -183,6 +183,21 @@ Each data source type has an adapter that handles:
 - **Push/subscribed sources** (OTEL receiver, Redis SUBSCRIBE, WebSocket, MQTT): Events arrive asynchronously. Each event can produce a gate trigger and/or update a CV value.
 - **Hybrid**: Some sources support both. E.g., Prometheus can be polled, but Alertmanager can push webhook alerts.
 
+#### Sequencer Integration for Slow-Updating Sources
+
+Remote data sources often update far slower than the sequencer step rate. The system uses a **two-tier update model**:
+
+1. **Data tier**: Remote sources poll at their natural rate (typically 1-60s for APIs, databases, and metrics endpoints). Raw values are cached in the source adapter.
+2. **Sequencer tier**: The sequencer reads the latest cached value on the **next loop/step boundary** rather than interrupting mid-sequence when a poll completes. This keeps sequencer timing deterministic.
+
+**Noise and mutation**: To avoid holding a static value between slow polls, sources may optionally apply a **noise or mutation layer** that runs at sequencer rate (or faster). This layer uses the last-known raw value as a center point and applies configurable jitter, drift, or random walk. Musically, this turns a value that updates every 15 seconds into a continuously evolving parameter.
+
+**Staleness**: The `ConnectionState` enum includes a `Stale` state (no new data within 3x the poll interval). Stale sources can be configured to:
+- Hold the last known value (default)
+- Activate the noise/mutation layer automatically
+- Decay toward a configurable rest value
+- Trigger a gate event to signal the staleness to downstream tracks
+
 See [SPECS.md — Data Source Specifications](SPECS.md#data-source-specifications) for protocol details, authentication methods, poll interval ranges, and resource limits.
 
 ### Sensor Bus Architecture (Hardware)
