@@ -18,6 +18,7 @@ Detailed hardware, electrical, and data source specifications for the Grafophone
 10. [Power Supply](#power-supply)
 11. [MIDI Electrical Specifications](#midi-electrical-specifications)
 12. [Calibration](#calibration)
+13. [CI/CD Pipeline Specifications](#cicd-pipeline-specifications)
 
 ---
 
@@ -90,25 +91,24 @@ Detailed hardware, electrical, and data source specifications for the Grafophone
 Non-inverting amplifier with gain of 4:
 
 ```
-                    R2 (30k)
-              ┌────/\/\/────┐
-              │      C1     │
-              │   ┌──||──┐  │
-              │   │(100pF)│  │
-DAC_OUT ──────┤   │       │  ├──── CV_OUT (0-10V)
-              │   │       │  │
-              │  ┌┴───────┴┐ │      R_out (470)
-              └──┤-   OUT  ├─┘──────/\/\/──── JACK
-                 │ OP-AMP  │
-          ┌──────┤+        │
-          │      └─────────┘
-          │
-         GND
-          │
-         R3 (10k)
-          │
-         GND
+                       R2 (30k)
+                 ┌────/\/\/────┐
+                 │      C1     │
+                 │   ┌──||──┐  │
+                 │   │(100pF)│  │
+                 │   │       │  │       R_out (470)
+                 │  ┌┴───────┴┐ └───────/\/\/──── JACK
+                 └──┤-   OUT  ├─────── CV_OUT (0-10V)
+                    │ OP-AMP  │
+DAC_OUT ────────────┤+        │
+                    └─────────┘
+                         │
+                        R3 (10k)
+                         │
+                        GND
 ```
+
+Note: In the non-inverting configuration, the signal enters the `+` input. R2 feeds back from the output to the `-` input, and R3 connects from the `-` input to GND.
 
 - Gain = 1 + R2/R3 = 1 + 30k/10k = 4
 - DAC 0V → 0V out, DAC 2.5V → 10V out
@@ -159,15 +159,17 @@ V_REF ──/\/\/───┘  └────┬────┘
 ### N-Channel MOSFET (10V Gate Output)
 
 ```
-GPIO (3.3V) ────[10k]──── Gate ┐
-                                │ BS170 / 2N7000
-                          Source┘──── GND
-                                │
-                          Drain ┘────┬──── GATE_OUT (0V or ~10V)
+                                   +12V
                                      │
                                 [10k pull-up]
                                      │
-                                   +12V
+                          Drain ─────┴──── GATE_OUT (0V or ~10V)
+                                │
+                          BS170 / 2N7000
+                                │
+                          Source ──── GND
+
+GPIO (3.3V) ────[10k]──── Gate
 ```
 
 - Output is **inverted**: GPIO HIGH → MOSFET on → drain LOW (0V); GPIO LOW → MOSFET off → drain HIGH (~12V via pull-up)
@@ -316,19 +318,22 @@ At 100 ppm/C (LM4040):
 
 ## Data Source Specifications
 
+For configuration YAML syntax and adapter architecture, see [DESIGN.md — Data Sources](DESIGN.md#data-sources).
+
 ### Supported Source Types
 
 | Source Type | Protocol | Directionality | Typical Latency | Auth Methods |
 |---|---|---|---|---|
 | **PostgreSQL** | TCP (libpq) | Poll (SQL query) | 1-50 ms | User/pass, SSL, mTLS |
 | **MySQL** | TCP | Poll (SQL query) | 1-50 ms | User/pass, SSL |
+| **SQLite** | File | Poll (SQL query) | < 1 ms | File permissions (no network auth) |
 | **Redis** | TCP (RESP) | Poll (command) or Push (SUBSCRIBE, keyspace) | < 1 ms | Password, ACL, TLS |
 | **Prometheus** | HTTP (PromQL) | Poll (query API) | 10-200 ms | Basic auth, Bearer token, mTLS |
 | **InfluxDB** | HTTP (Flux/InfluxQL) | Poll (query API) | 10-200 ms | Token, user/pass |
 | **Grafana** | HTTP (JSON API) | Poll (dashboard/panel query) | 50-500 ms | API key, Bearer token |
 | **OpenTelemetry** | gRPC or HTTP (OTLP) | Push (receiver endpoint) | < 10 ms | mTLS, API key headers |
 | **REST API** | HTTP/HTTPS | Poll (GET/POST) | 10-500 ms | API key, OAuth2, Bearer token |
-| **GraphQL** | HTTP/HTTPS | Poll (query) | 10-500 ms | API key, Bearer token |
+| **GraphQL** | HTTP/HTTPS | Poll (query) | 10-500 ms | API key, Bearer token | (shares REST adapter; sends POST with query body) |
 | **WebSocket** | WS/WSS | Push (persistent connection) | < 10 ms | Token in handshake, custom headers |
 | **MQTT** | TCP/TLS | Push (subscribe to topic) | < 10 ms | User/pass, TLS, client cert |
 | **Kafka** | TCP | Push (consumer group) | 10-100 ms | SASL, TLS |
@@ -377,6 +382,23 @@ normalized = clamp((raw_value - range_min) / (range_max - range_min), 0.0, 1.0)
 | **Delta** | Normalize the rate of change rather than the absolute value. Useful for monotonic counters. |
 | **Z-score** | Normalize relative to running mean and standard deviation. Useful for anomaly detection → musical surprise. |
 
+### Credential Management
+
+Connection strings, passwords, API keys, and tokens must never be hardcoded in YAML config files. The configuration loader supports environment variable substitution using `${VAR_NAME}` syntax.
+
+| Mechanism | Usage | Example |
+|---|---|---|
+| **Environment variables** | Primary method. Substituted at config load time. | `connection: "${GRAFOPHONE_POSTGRES_URL}"` |
+| **Env file** | For systemd deployments, use `EnvironmentFile=` directive. | `/etc/grafophone/env` with `GRAFOPHONE_POSTGRES_URL=postgres://...` |
+| **Secrets manager** | For production. Fetch secrets at startup via SDK. | HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager |
+| **File reference** | For TLS certs/keys. Config points to file path. | `tls_cert: "/etc/grafophone/tls/client.crt"` |
+
+**Security requirements:**
+- The config loader must refuse to start if an `${VAR_NAME}` reference resolves to an empty string (fail-closed).
+- Config files must not be world-readable. Recommended permissions: `0600` owned by the grafophone service user.
+- Log output must redact connection strings and tokens. Use `[REDACTED]` for any field containing `password`, `token`, `key`, or `secret`.
+- SQL queries from config files are executed as-is (trusted admin input). The database user should have **read-only** permissions. The application does not perform query validation or sanitization.
+
 ### Connection Management
 
 | Behavior | Specification |
@@ -399,6 +421,7 @@ Grafophone can act as an OpenTelemetry collector endpoint, receiving telemetry p
 | Trace handling | Span start → gate on. Span end → gate off. Duration → CV. Span attributes → mappable values. |
 | Log handling | Log event → trigger pulse. Severity → velocity/CV. Body regex match → configurable trigger. |
 | Filtering | By service name, metric name, span name, log severity, resource attributes |
+| Authentication | mTLS (recommended), API key via header, or none (not recommended — accepts arbitrary telemetry) |
 | Buffering | Ring buffer per metric/span stream, same as hardware sensor streams |
 
 ### Resource Limits
@@ -511,7 +534,7 @@ Or use a simple buffer/inverter IC (74HCT14) instead of transistor.
 | Parameter | Specification |
 |---|---|
 | Baud rate | 31250 bps |
-| Current loop | 5 mA through opto-isolator at receiver |
+| Current loop | 5 mA (drives opto-isolator at receiving device) |
 | Source resistors | 220 ohm on pins 4 and 5 |
 | Connector | 5-pin DIN (180 degree) |
 | Cable length | Up to 15 meters |
@@ -573,3 +596,733 @@ This corrects for DAC INL, op-amp nonlinearity, and resistor tolerance errors. E
 - User re-calibration available via menu/button sequence
 - Auto-calibration on power-up (optional, if audio input is available)
 - Temperature compensation: re-calibrate if ambient temperature changes significantly (>10C)
+
+---
+
+## CI/CD Pipeline Specifications
+
+### Overview
+
+All CI/CD runs on **GitHub Actions**. The pipeline is defined in `.github/workflows/` with separate workflow files for CI (every push/PR) and Release (tag push).
+
+### Required Go Version
+
+| Dependency | Version | Notes |
+|---|---|---|
+| **Go** | >= 1.23 | Use `actions/setup-go@v5` with version from `go.mod` |
+| **golangci-lint** | >= 1.62 | Installed via `golangci/golangci-lint-action@v6` |
+| **GoReleaser** | >= 2.5 | Installed via `goreleaser/goreleaser-action@v6` |
+| **govulncheck** | latest | Installed via `go install golang.org/x/vuln/cmd/govulncheck@latest` |
+
+### Stage 1: Lint & Static Analysis
+
+**Workflow file**: `.github/workflows/ci.yml` (job: `lint`)
+
+**Tool: `golangci-lint`** — aggregates 50+ Go linters in a single binary. Configured via `.golangci.yml`.
+
+**Enabled linters (`.golangci.yml`):**
+
+| Linter | Category | What It Catches |
+|---|---|---|
+| `govet` | Correctness | Printf format strings, struct tags, unreachable code |
+| `errcheck` | Correctness | Unchecked error return values |
+| `staticcheck` | Correctness | Bugs, simplifications, performance (SA*, S*, ST*, QF* rules) |
+| `gosimple` | Simplification | Code that can be simplified |
+| `unused` | Dead code | Unused functions, types, variables, constants |
+| `ineffassign` | Correctness | Assignments to variables that are never read |
+| `typecheck` | Correctness | Type-checking errors |
+| `gocritic` | Style/Perf | Opinionated diagnostics (hugeParam, rangeValCopy, etc.) |
+| `revive` | Style | Configurable superset of `golint` |
+| `gofumpt` | Formatting | Stricter `gofmt` — enforces consistent formatting |
+| `misspell` | Docs | Commonly misspelled English words in comments/strings |
+| `bodyclose` | Correctness | Unclosed HTTP response bodies |
+| `noctx` | Correctness | HTTP requests without context.Context |
+| `exhaustive` | Correctness | Non-exhaustive switch statements on sum types |
+| `gosec` | Security | Potential security issues (G101-G601 rules) |
+| `prealloc` | Performance | Slice declarations that could be preallocated |
+
+**Additional static analysis tools:**
+
+| Tool | Purpose | Invocation |
+|---|---|---|
+| `go vet ./...` | Official Go static analyzer | Built-in, also run by golangci-lint |
+| `govulncheck ./...` | Known vulnerability scanner for Go dependencies | Checks against Go vulnerability database |
+| **YAML schema validation** | Validate example configs against JSON Schema | `go test ./internal/config/...` (schema test) |
+
+**golangci-lint configuration (`.golangci.yml`):**
+
+```yaml
+run:
+  timeout: 5m
+  go: "1.23"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - gosimple
+    - unused
+    - ineffassign
+    - typecheck
+    - gocritic
+    - revive
+    - gofumpt
+    - misspell
+    - bodyclose
+    - noctx
+    - exhaustive
+    - gosec
+    - prealloc
+
+linters-settings:
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - style
+      - performance
+  revive:
+    rules:
+      - name: blank-imports
+      - name: context-as-argument
+      - name: dot-imports
+      - name: error-return
+      - name: error-strings
+      - name: exported
+      - name: increment-decrement
+      - name: var-naming
+      - name: package-comments
+        disabled: true   # allow packages without doc comments during early dev
+  gosec:
+    excludes:
+      - G104   # allow unhandled errors in deferred Close() calls
+  exhaustive:
+    default-signifies-exhaustive: true
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
+```
+
+### Stage 2: Unit Tests
+
+**Workflow file**: `.github/workflows/ci.yml` (job: `test`)
+
+**Tools and flags:**
+
+```bash
+# Run all unit tests with race detector and coverage
+go test -race -coverprofile=coverage.out -covermode=atomic ./...
+
+# Upload coverage to Codecov (or similar)
+# Coverage gate: fail if total coverage < 80%
+
+# Fuzz tests (time-limited in CI, unlimited locally)
+go test -fuzz=FuzzMapper -fuzztime=30s ./internal/mapper/...
+go test -fuzz=FuzzQuantizer -fuzztime=30s ./internal/mapper/...
+go test -fuzz=FuzzConfigParse -fuzztime=30s ./internal/config/...
+```
+
+**Unit test conventions:**
+
+| Convention | Specification |
+|---|---|
+| Test file location | `*_test.go` alongside source files |
+| Build tag for integration tests | `//go:build integration` — excluded from unit test runs |
+| Build tag for acceptance tests | `//go:build acceptance` — excluded from unit test runs |
+| Table-driven tests | Required for all functions with multiple input/output cases |
+| Test helpers | Use `t.Helper()` for shared setup functions |
+| Golden files | Use `testdata/` directories for expected output fixtures |
+| Mocks | Use interfaces + hand-written mocks (no code generation frameworks) |
+| Benchmarks | `Benchmark*` functions for hot-path code (mapper, quantizer, ring buffer) |
+
+**Coverage requirements:**
+
+| Package | Minimum Coverage |
+|---|---|
+| `internal/engine` | 85% |
+| `internal/mapper` | 90% |
+| `internal/buffer` | 90% |
+| `internal/config` | 85% |
+| `internal/input/datasource` | 80% |
+| `internal/output` | 80% |
+| **Overall** | **80%** |
+
+**Fuzz targets:**
+
+| Target | What It Fuzzes |
+|---|---|
+| `FuzzMapper` | Mapping curve functions with arbitrary float64 inputs — catch panics, NaN, Inf |
+| `FuzzQuantizer` | Scale quantizer with arbitrary pitch values — ensure output is always in-scale |
+| `FuzzConfigParse` | YAML config parser with arbitrary bytes — catch panics, ensure graceful errors |
+| `FuzzNormalize` | Normalization function with edge-case ranges — division by zero, negative ranges |
+
+### Stage 3: Build
+
+**Workflow file**: `.github/workflows/ci.yml` (job: `build`)
+
+**Build matrix:**
+
+| GOOS | GOARCH | Target Platform | Artifact Name |
+|---|---|---|---|
+| `linux` | `amd64` | Dev machines, CI, Docker | `grafophone-linux-amd64` |
+| `linux` | `arm64` | Raspberry Pi 3/4/5 (64-bit OS) | `grafophone-linux-arm64` |
+| `linux` | `arm` (GOARM=6) | Raspberry Pi Zero (W) / Pi 1 (32-bit) | `grafophone-linux-arm` |
+| `darwin` | `arm64` | macOS Apple Silicon (dev) | `grafophone-darwin-arm64` |
+
+**Build command:**
+
+```bash
+CGO_ENABLED=0 GOOS=${os} GOARCH=${arch} go build \
+  -ldflags "-s -w \
+    -X main.version=${GITHUB_REF_NAME:-dev} \
+    -X main.commit=$(git rev-parse --short HEAD) \
+    -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  -o grafophone-${os}-${arch} \
+  ./cmd/grafophone/
+```
+
+- `CGO_ENABLED=0`: Static binary, no libc dependency. Critical for cross-compilation and Pi deployment.
+- `-s -w`: Strip debug symbols and DWARF — reduces binary size ~30%.
+- Artifacts uploaded via `actions/upload-artifact@v4` for use in later stages.
+
+### Stage 4: Integration Tests
+
+**Workflow file**: `.github/workflows/ci.yml` (job: `integration`)
+
+**Triggered**: On PRs to `main` and on `main` branch pushes. Skipped on feature branch pushes (too slow for rapid iteration).
+
+**Infrastructure (Docker Compose):**
+
+```yaml
+# .github/docker-compose.integration.yml
+# NOTE: All credentials below are ephemeral CI-only test fixtures.
+# Never use these values in production. See DESIGN.md for credential management guidance.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: grafophone_test
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+    ports: ["5432:5432"]
+    healthcheck:
+      test: pg_isready -U test
+      interval: 2s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass test
+    ports: ["6379:6379"]
+    healthcheck:
+      test: redis-cli -a test ping
+      interval: 2s
+      retries: 10
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./testdata/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports: ["9090:9090"]
+    healthcheck:
+      test: wget -qO- http://localhost:9090/-/healthy
+      interval: 2s
+      retries: 10
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    volumes:
+      - ./testdata/mosquitto.conf:/mosquitto/config/mosquitto.conf
+    ports: ["1883:1883"]
+    healthcheck:
+      test: mosquitto_sub -t '$$SYS/broker/uptime' -C 1 -W 2
+      interval: 2s
+      retries: 10
+```
+
+Note: `testdata/mosquitto.conf` should set `allow_anonymous true` for CI use only. In production MQTT deployments, always require authentication.
+
+**Test execution:**
+
+```bash
+# Start services
+docker compose -f .github/docker-compose.integration.yml up -d --wait
+
+# Run integration tests (all credentials are CI-only ephemeral values)
+GRAFOPHONE_TEST_POSTGRES_URL="postgres://test:test@localhost:5432/grafophone_test?sslmode=prefer" \
+GRAFOPHONE_TEST_REDIS_URL="redis://:test@localhost:6379" \
+GRAFOPHONE_TEST_PROMETHEUS_URL="http://localhost:9090" \
+GRAFOPHONE_TEST_MQTT_URL="tcp://localhost:1883" \
+go test -race -tags=integration -count=1 -timeout=5m ./...
+
+# Teardown
+docker compose -f .github/docker-compose.integration.yml down -v
+```
+
+**Integration test scope:**
+
+| Test Suite | What It Validates |
+|---|---|
+| `datasource/postgres_integration_test.go` | Connect, query, value extraction, reconnection on failure, connection pooling |
+| `datasource/redis_integration_test.go` | GET/LLEN polling, SUBSCRIBE push, keyspace notifications, reconnection |
+| `datasource/prometheus_integration_test.go` | PromQL instant query, range query, value extraction from result vector |
+| `datasource/mqtt_integration_test.go` | Subscribe, receive message, value extraction, QoS 0 and 1 |
+| `datasource/websocket_integration_test.go` | Connect to echo server, receive messages, value extraction, reconnection |
+| `config/config_integration_test.go` | Load full multi-source config, validate all adapters initialize, health check |
+
+### Stage 5: Acceptance Tests
+
+**Workflow file**: `.github/workflows/ci.yml` (job: `acceptance`)
+
+**Triggered**: On `main` branch only (merge commits). Not on PRs (integration tests provide sufficient confidence for PR review).
+
+**Test execution:**
+
+```bash
+go test -race -tags=acceptance -count=1 -timeout=10m ./test/acceptance/...
+```
+
+**Acceptance test scope:**
+
+End-to-end tests that exercise the full pipeline from config file through to output, with mocked hardware backends:
+
+| Test Scenario | Description |
+|---|---|
+| `TestPrometheusToMIDI` | Prometheus query → mapper (linear) → quantizer (C major) → MIDI note on/off. Verify correct MIDI bytes. |
+| `TestRedisToCV` | Redis LLEN → mapper (log) → CV output (mock SPI backend). Verify DAC codes match expected voltages. |
+| `TestMultiSourceMultiTrack` | 4 data sources → 4 tracks → 4 outputs simultaneously. Verify independence and clock sync. |
+| `TestOTELReceiverToGate` | Push OTLP log event → severity filter → gate trigger. Verify gate on/off timing. |
+| `TestConfigReload` | Modify YAML config at runtime → verify sources reconnect, mappings update, no output glitch. |
+| `TestGracefulShutdown` | Send SIGTERM → verify all connections closed, no panics, clean exit code. |
+| `TestClockSync` | External MIDI clock input → verify sequencer follows tempo, outputs on correct beats. |
+| `TestRecordPlaybackLoop` | Record 8 steps from data source, stop, play back, verify output matches recording. |
+
+**Mock backends:**
+
+- `internal/output/cv_mock.go`: Records all `WritePitch`/`WriteMod`/`WriteGate` calls with timestamps. Used to verify output correctness without hardware.
+- `internal/output/midi_mock.go`: Captures MIDI byte stream. Assertions verify note/CC/clock messages.
+- `internal/input/sensor/sensor_mock.go`: Replays recorded sensor data from golden files.
+
+### Stage 6: Release
+
+**Workflow file**: `.github/workflows/release.yml`
+
+**Triggered**: On tag push matching `v*` (e.g., `v0.3.0`, `v1.0.0-rc.1`).
+
+**Tool: GoReleaser** — builds, packages, and publishes release artifacts.
+
+**GoReleaser configuration (`.goreleaser.yml`):**
+
+```yaml
+version: 2
+
+project_name: grafophone
+
+before:
+  hooks:
+    - go mod tidy
+    - go generate ./...
+
+builds:
+  - id: grafophone
+    main: ./cmd/grafophone/
+    binary: grafophone
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+      - arm
+    goarm:
+      - "6"
+    ignore:
+      - goos: darwin
+        goarch: arm
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+      - -X main.date={{.Date}}
+
+  - id: grafocal
+    main: ./cmd/grafocal/
+    binary: grafocal
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - arm64
+      - arm
+    goarm:
+      - "6"
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+
+archives:
+  - id: grafophone-archive
+    builds:
+      - grafophone
+    name_template: "{{ .ProjectName }}-{{ .Version }}-{{ .Os }}-{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
+    format: tar.gz
+    files:
+      - LICENSE
+      - CHANGELOG.md
+      - configs/examples/**
+
+  - id: grafocal-archive
+    builds:
+      - grafocal
+    name_template: "grafocal-{{ .Version }}-{{ .Os }}-{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
+    format: tar.gz
+
+nfpms:
+  - id: grafophone-deb
+    package_name: grafophone
+    builds:
+      - grafophone
+    vendor: Grafophone
+    homepage: https://github.com/leftathome/grafophone
+    maintainer: Grafophone Contributors
+    description: Sensor-to-synthesizer sequencer
+    license: TBD
+    formats:
+      - deb
+    contents:
+      - src: configs/default.yml
+        dst: /etc/grafophone/config.yml
+        type: config
+      - src: scripts/grafophone.service
+        dst: /lib/systemd/system/grafophone.service
+    scripts:
+      postinstall: scripts/postinstall.sh
+
+dockers:
+  - image_templates:
+      - "ghcr.io/leftathome/grafophone:{{ .Version }}-amd64"
+    build_flag_templates:
+      - "--platform=linux/amd64"
+    use: buildx
+    dockerfile: Dockerfile
+    ids:
+      - grafophone
+
+  - image_templates:
+      - "ghcr.io/leftathome/grafophone:{{ .Version }}-arm64"
+    build_flag_templates:
+      - "--platform=linux/arm64"
+    use: buildx
+    dockerfile: Dockerfile
+    ids:
+      - grafophone
+
+docker_manifests:
+  - name_template: "ghcr.io/leftathome/grafophone:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/leftathome/grafophone:{{ .Version }}-amd64"
+      - "ghcr.io/leftathome/grafophone:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/leftathome/grafophone:latest"
+    image_templates:
+      - "ghcr.io/leftathome/grafophone:{{ .Version }}-amd64"
+      - "ghcr.io/leftathome/grafophone:{{ .Version }}-arm64"
+
+checksum:
+  name_template: "SHA256SUMS"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^ci:"
+      - "^chore:"
+      - "^refactor:"
+      - "^test:"
+  groups:
+    - title: Features
+      regexp: "^feat:"
+    - title: Bug Fixes
+      regexp: "^fix:"
+    - title: Performance
+      regexp: "^perf:"
+    - title: Others
+      order: 999
+```
+
+**Dockerfile:**
+
+```dockerfile
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY grafophone /usr/local/bin/grafophone
+USER nonroot:nonroot
+EXPOSE 4317 4318
+ENTRYPOINT ["grafophone"]
+CMD ["--config", "/etc/grafophone/config.yml"]
+```
+
+- Uses distroless base image (no shell, no package manager — minimal attack surface).
+- Runs as non-root user `nonroot` (UID 65534).
+- Ports 4317/4318 are for optional OTEL receiver; not exposed unless configured.
+- Config file is mounted at runtime via Docker volume or bind mount.
+
+**systemd unit file (`scripts/grafophone.service`):**
+
+```ini
+[Unit]
+Description=Grafophone sensor-to-synthesizer sequencer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=grafophone
+Group=grafophone
+ExecStart=/usr/bin/grafophone --config /etc/grafophone/config.yml
+EnvironmentFile=-/etc/grafophone/env
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**postinstall script (`scripts/postinstall.sh`):**
+
+```bash
+#!/bin/sh
+# Create service user (no login shell, no home directory)
+id -u grafophone >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin grafophone
+# Set config permissions
+chmod 0640 /etc/grafophone/config.yml
+chown root:grafophone /etc/grafophone/config.yml
+# Enable and start service
+systemctl daemon-reload
+systemctl enable grafophone
+```
+
+**Release workflow (`.github/workflows/release.yml`):**
+
+```yaml
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+### CI Workflow (`.github/workflows/ci.yml`)
+
+```yaml
+name: CI
+on:
+  push:
+    branches: [main, "feature/**", "claude/**"]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.62
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+      - name: Markdown link check
+        uses: gaurav-nelson/github-action-markdown-link-check@v1
+        with:
+          use-quiet-mode: 'yes'
+          config-file: '.markdown-link-check.json'
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Unit tests
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+      - name: Check coverage
+        run: |
+          total=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | tr -d '%')
+          echo "Total coverage: ${total}%"
+          if (( $(echo "$total < 80" | bc -l) )); then
+            echo "Coverage ${total}% is below 80% threshold"
+            exit 1
+          fi
+      - name: Fuzz tests
+        run: |
+          go test -fuzz=FuzzMapper -fuzztime=30s ./internal/mapper/...
+          go test -fuzz=FuzzQuantizer -fuzztime=30s ./internal/mapper/...
+          go test -fuzz=FuzzNormalize -fuzztime=30s ./internal/input/...
+          go test -fuzz=FuzzConfigParse -fuzztime=30s ./internal/config/...
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  build:
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: arm
+            goarm: "6"
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          go build -ldflags "-s -w \
+            -X main.version=${GITHUB_REF_NAME:-dev} \
+            -X main.commit=$(git rev-parse --short HEAD) \
+            -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o grafophone-${{ matrix.goos }}-${{ matrix.goarch }} \
+            ./cmd/grafophone/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grafophone-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: grafophone-${{ matrix.goos }}-${{ matrix.goarch }}
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: [test, build]
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+    # NOTE: All credentials below are ephemeral CI-only test fixtures.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: grafophone_test
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+      prometheus:
+        image: prom/prometheus:latest
+        ports: ["9090:9090"]
+        options: >-
+          --health-cmd "wget -qO- http://localhost:9090/-/healthy || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      mosquitto:
+        image: eclipse-mosquitto:2
+        ports: ["1883:1883"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Integration tests
+        env:
+          GRAFOPHONE_TEST_POSTGRES_URL: "postgres://test:test@localhost:5432/grafophone_test?sslmode=prefer"
+          GRAFOPHONE_TEST_REDIS_URL: "redis://localhost:6379"
+          GRAFOPHONE_TEST_PROMETHEUS_URL: "http://localhost:9090"
+          GRAFOPHONE_TEST_MQTT_URL: "tcp://localhost:1883"
+        run: go test -race -tags=integration -count=1 -timeout=5m ./...
+
+  acceptance:
+    runs-on: ubuntu-latest
+    needs: integration
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Acceptance tests
+        run: go test -race -tags=acceptance -count=1 -timeout=10m ./test/acceptance/...
+```
+
+### Commit Message Convention
+
+Follow [Conventional Commits](https://www.conventionalcommits.org/) for changelog generation:
+
+| Prefix | Meaning | Changelog Section |
+|---|---|---|
+| `feat:` | New feature | Features |
+| `fix:` | Bug fix | Bug Fixes |
+| `perf:` | Performance improvement | Performance |
+| `refactor:` | Code restructuring | (excluded from changelog) |
+| `test:` | Test additions/changes | (excluded from changelog) |
+| `docs:` | Documentation | (excluded from changelog) |
+| `ci:` | CI/CD changes | (excluded from changelog) |
+| `chore:` | Maintenance | (excluded from changelog) |
+| `BREAKING CHANGE:` | In body/footer | Breaking Changes (bumps MAJOR) |

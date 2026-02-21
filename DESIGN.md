@@ -7,7 +7,7 @@ Grafophone transforms real-world data streams into musical sequences for analog 
 1. **Hardware sensors** — IMUs, environmental sensors, touch surfaces, distance sensors, microphones (connected via I2C/SPI/ADC/BLE)
 2. **Software data sources** — databases (Postgres, Redis), observability platforms (Grafana, Prometheus), OpenTelemetry endpoints, REST/GraphQL APIs, and arbitrary time-series feeds
 
-Data from either source class is mapped to musical parameters and output as CV/Gate signals, MIDI, and/or VST plugin automation.
+Data from either source class is mapped to musical parameters and output as CV/Gate signals, MIDI, OSC, and/or VST plugin automation.
 
 The system bridges the physical and digital worlds and the modular synthesizer — turning server metrics into melodies, gesture into rhythm, infrastructure alerts into triggers, and environmental flux into evolving sonic textures.
 
@@ -22,6 +22,9 @@ The system bridges the physical and digital worlds and the modular synthesizer �
 5. [Hardware Platform](#hardware-platform)
 6. [Software Architecture](#software-architecture)
 7. [Open Source References](#open-source-references)
+8. [CI/CD Pipeline](#cicd-pipeline)
+9. [Build Artifacts & Release Process](#build-artifacts--release-process)
+10. [Development Phases](#development-phases)
 
 For detailed technical specifications, see [SPECS.md](SPECS.md).
 
@@ -127,15 +130,15 @@ Each data source is defined by:
 sources:
   - name: "cpu_load"
     type: prometheus
-    endpoint: "http://prometheus:9090"
+    endpoint: "${PROMETHEUS_URL}"          # e.g. https://prometheus:9090
     query: "avg(rate(node_cpu_seconds_total{mode!='idle'}[1m]))"
     poll_interval: 1s
-    value_path: "result[0].value[1]"    # JSONPath to extract scalar
-    range: [0.0, 1.0]                    # expected value range for normalization
+    value_path: "result[0].value[1]"      # JSONPath to extract scalar
+    range: [0.0, 1.0]                      # expected value range for normalization
 
   - name: "active_users"
     type: postgres
-    connection: "postgresql://user:pass@host/db"
+    connection: "${GRAFOPHONE_POSTGRES_URL}" # e.g. postgresql://user:pass@host/db
     query: "SELECT count(*) FROM sessions WHERE active = true"
     poll_interval: 5s
     range: [0, 10000]
@@ -145,12 +148,12 @@ sources:
     protocol: grpc
     port: 4317
     filter: "severity >= ERROR"
-    mode: push                            # event-driven, not polled
+    mode: push                              # event-driven, not polled
     # Each matching event produces a trigger/gate
 
   - name: "redis_queue_depth"
     type: redis
-    connection: "redis://localhost:6379"
+    connection: "${GRAFOPHONE_REDIS_URL}"   # e.g. redis://:password@host:6379
     command: "LLEN work_queue"
     poll_interval: 500ms
     range: [0, 1000]
@@ -158,9 +161,11 @@ sources:
   - name: "btc_price"
     type: websocket
     url: "wss://stream.binance.com/ws/btcusdt@trade"
-    value_path: "p"                       # price field from JSON message
+    value_path: "p"                         # price field from JSON message
     range: [20000, 100000]
 ```
+
+**Credential management:** Connection strings and API keys must never be hardcoded in config files. Use environment variable substitution (`${VAR_NAME}`) in YAML configs. The config loader expands environment variables at startup. For production deployments, inject secrets via a secrets manager (e.g., HashiCorp Vault, systemd `EnvironmentFile`, Kubernetes secrets).
 
 #### Data Source Adapters
 
@@ -178,9 +183,11 @@ Each data source type has an adapter that handles:
 - **Push/subscribed sources** (OTEL receiver, Redis SUBSCRIBE, WebSocket, MQTT): Events arrive asynchronously. Each event can produce a gate trigger and/or update a CV value.
 - **Hybrid**: Some sources support both. E.g., Prometheus can be polled, but Alertmanager can push webhook alerts.
 
+See [SPECS.md — Data Source Specifications](SPECS.md#data-source-specifications) for protocol details, authentication methods, poll interval ranges, and resource limits.
+
 ### Sensor Bus Architecture (Hardware)
 
-- **I2C bus** (400 kHz Fast Mode): IMU, environmental, light, ToF sensors. Use TCA9548A multiplexer for address conflicts (up to 64 buses).
+- **I2C bus** (400 kHz Fast Mode): IMU, environmental, light, ToF sensors. Use TCA9548A 8-channel I2C multiplexer for address conflicts (up to 8 multiplexers for 64 downstream channels).
 - **SPI bus** (10+ MHz): High-speed ADCs (MCP3208), DACs, displays. One CS line per device.
 - **Analog inputs**: Via external ADC (MCP3208 for 8-channel 12-bit, ADS1115 for 16-bit). Flex sensors, FSRs, phototransistors, analog microphones.
 - **BLE/WiFi**: ESP32 or Pi for receiving wireless sensor data. ESP-NOW for low-latency connectionless streaming.
@@ -275,7 +282,7 @@ Sensor values are mapped to musical parameters through configurable **mapping sl
 ### CV/Gate (Analog)
 
 **Voltage Standards:**
-- **1V/Oct pitch CV**: 1 volt per octave, the dominant standard. 0V = C0 or configurable reference. 5V range = 5 octaves.
+- **1V/Oct pitch CV**: 1 volt per octave, the dominant standard. 0V = configurable reference note (commonly C1 or C2, varies by manufacturer). 5V range = 5 octaves.
 - **Gate**: 0V (off) / +5V or +10V (on). Active duration configurable. Rise time < 1 ms.
 - **Trigger**: 5-10 ms pulse at gate voltage. For clocks, resets, drum triggers.
 - **Modulation CV**: 0-5V, 0-10V, or +/-5V depending on destination. For filter cutoff, VCA level, waveshaping.
@@ -292,7 +299,7 @@ See [SPECS.md](SPECS.md) for DAC selection, output stage circuits, and calibrati
 ### MIDI
 
 - **USB MIDI**: Device mode (appears as MIDI controller to host computer or hardware). Pi 4 / Pi Zero gadget mode or Teensy native USB.
-- **DIN-5 MIDI**: Traditional 5-pin MIDI out via UART + optocoupler circuit.
+- **DIN-5 MIDI**: Traditional 5-pin MIDI out via UART + transistor/buffer driver circuit.
 - **MIDI messages**: Note On/Off, CC (continuous controllers), pitch bend, clock, start/stop, program change.
 - **MPE (MIDI Polyphonic Expression)**: Per-note pitch bend, pressure, and slide for expressive control of MPE-capable synths.
 - **BLE MIDI**: Wireless MIDI over Bluetooth Low Energy (ESP32 native support).
@@ -309,7 +316,7 @@ See [SPECS.md](SPECS.md) for DAC selection, output stage circuits, and calibrati
 A companion DAW plugin that receives sensor data from the hardware and exposes it as automatable parameters:
 
 **Plugin Frameworks (ranked):**
-1. **CLAP** (CLever Audio Plugin): Modern, open-source, extensible. Best for new development. Supports per-note modulation natively.
+1. **CLAP** (CLever Audio Plug-in API): Modern, open-source, extensible. Best for new development. Supports per-note modulation natively.
 2. **VST3** (Steinberg): Widest DAW compatibility. Use JUCE or iPlug2 framework.
 3. **JUCE** (framework): Cross-platform, builds VST3/AU/CLAP/AAX from one codebase. Industry standard. GPLv3 or commercial license.
 4. **iPlug2** (framework): Lightweight alternative to JUCE, builds VST2/VST3/AU/AAX/CLAP. Liberal license (WDL).
@@ -361,7 +368,7 @@ For users without dedicated hardware, the sequencer engine can run as software t
 | **Op-amp** | OPA4171 (quad, precision) | Low offset, rail-to-rail, powers from +/-12V |
 | **Voltage ref** | REF5025 (2.5V, 3 ppm/C) | Stable pitch CV reference |
 | **OS** | Patchbox OS (PREEMPT_RT) | Pre-configured for audio, low latency |
-| **Language** | Python (UI/mapping) + C (real-time CV loop) | Best of both worlds |
+| **Language** | Go (single static binary, `periph.io` for SPI/I2C) | Goroutines for concurrent data sources, zero deployment deps |
 
 #### Configuration B: ESP32 (Compact/Wireless)
 
@@ -397,85 +404,244 @@ For users without dedicated hardware, the sequencer engine can run as software t
 
 ## Software Architecture
 
+### Language Choice
+
+**Primary language: Go** for the core application (sequencer engine, data source adapters, sensor drivers, CV/MIDI output, CLI/web UI).
+
+| Concern | Why Go |
+|---|---|
+| **Concurrency** | Goroutines map naturally to 32+ concurrent data source pollers/subscribers, each running independently |
+| **Observability ecosystem** | OTEL SDK, Prometheus client, gRPC — all Go-native, first-class support |
+| **Database drivers** | `database/sql` + `pgx` (Postgres), `go-redis`, `sarama` (Kafka), `paho` (MQTT) — mature, well-tested |
+| **Hardware I/O** | `periph.io` for SPI/I2C/GPIO on Raspberry Pi; `go-midi` for MIDI |
+| **Cross-compilation** | `CGO_ENABLED=0 GOOS=linux GOARCH=arm64` produces a static binary for Pi — no runtime dependencies |
+| **Deployment** | Single binary. Copy to Pi, run. No virtualenv, no node_modules, no JVM. |
+| **Testing** | Built-in `testing` package, race detector (`-race`), benchmarks, fuzzing |
+| **Static analysis** | `golangci-lint` aggregates 50+ linters in one tool |
+
+**Exceptions (separate codebases):**
+- **ESP32/Teensy firmware**: C++ (ESP-IDF / Arduino framework). Communicates with Go core via USB serial or BLE.
+- **VST/CLAP plugin**: C++ (JUCE or iPlug2). Communicates with Go core via OSC or USB MIDI.
+
+### Go Module Structure (Planned)
+
+```
+grafophone/
+├── cmd/
+│   ├── grafophone/          # main CLI binary
+│   │   └── main.go
+│   └── grafocal/            # standalone calibration tool
+│       └── main.go
+├── internal/
+│   ├── engine/              # sequencer engine (clock, transport, tracks)
+│   ├── mapper/              # mapping curves, quantizer, scale library
+│   ├── buffer/              # ring buffer for time-series capture
+│   ├── input/               # InputSource interface + implementations
+│   │   ├── source.go        # interface definition
+│   │   ├── sensor/          # hardware sensor drivers (I2C, SPI, ADC)
+│   │   │   ├── imu.go
+│   │   │   ├── env.go
+│   │   │   └── ...
+│   │   └── datasource/      # software data source adapters
+│   │       ├── prometheus.go
+│   │       ├── postgres.go
+│   │       ├── redis.go
+│   │       ├── otel.go
+│   │       ├── websocket.go
+│   │       ├── mqtt.go
+│   │       ├── rest.go
+│   │       └── ...
+│   ├── output/              # Output interface + implementations
+│   │   ├── cv.go            # CV/Gate via SPI/I2C DAC
+│   │   ├── midi.go          # USB MIDI, DIN MIDI, BLE MIDI
+│   │   └── osc.go           # OSC over UDP
+│   ├── config/              # YAML config parsing, validation
+│   ├── calibration/         # DAC calibration routines, lookup tables
+│   └── ui/                  # Web UI (embedded), display driver
+├── firmware/                # ESP32/Teensy C++ firmware (separate build)
+│   ├── esp32/
+│   └── teensy/
+├── plugin/                  # VST/CLAP C++ plugin (separate build)
+├── configs/                 # example YAML configurations
+├── scripts/                 # build, release, flash scripts
+├── .github/
+│   └── workflows/           # CI/CD pipeline definitions
+├── .golangci.yml            # linter configuration
+├── go.mod
+├── go.sum
+├── Makefile
+├── DESIGN.md
+├── SPECS.md
+└── CHANGELOG.md
+```
+
+### Key Go Dependencies
+
+| Package | Purpose |
+|---|---|
+| `periph.io/x/conn/v3` | SPI, I2C, GPIO abstraction for Pi hardware |
+| `periph.io/x/host/v3` | Host driver initialization |
+| `github.com/jackc/pgx/v5` | PostgreSQL driver (fast, full-featured) |
+| `github.com/redis/go-redis/v9` | Redis client with Pub/Sub support |
+| `github.com/prometheus/client_golang` | Prometheus metrics exposition |
+| `github.com/prometheus/common/model` | Prometheus query result types |
+| `go.opentelemetry.io/collector` | OTEL collector receiver components |
+| `go.opentelemetry.io/otel` | OTEL SDK for internal instrumentation |
+| `google.golang.org/grpc` | gRPC for OTEL OTLP receiver |
+| `github.com/gorilla/websocket` | WebSocket client |
+| `github.com/eclipse/paho.mqtt.golang` | MQTT client |
+| `github.com/IBM/sarama` | Kafka consumer |
+| `gitlab.com/gomidi/midi/v2` | MIDI message encoding/decoding |
+| `gopkg.in/yaml.v3` | YAML config parsing |
+| `github.com/hypebeast/go-osc` | OSC message encoding/sending |
+
 ### Module Decomposition
 
 ```
 ┌─────────────────────────────────────────────┐
-│                 Application                  │
+│              cmd/grafophone                  │
 │                                              │
 │  ┌─────────┐ ┌──────────┐ ┌──────────────┐ │
-│  │   UI    │ │  Preset  │ │  Calibration │ │
-│  │ Manager │ │  Storage │ │   Routines   │ │
+│  │ Web UI  │ │  Config  │ │  Calibration │ │
+│  │ (embed) │ │  (YAML)  │ │   (grafocal)  │ │
 │  └────┬────┘ └────┬─────┘ └──────┬───────┘ │
 │       │           │              │          │
 │  ┌────▼───────────▼──────────────▼────────┐ │
-│  │          Sequencer Engine              │ │
+│  │    internal/engine (Sequencer Engine)  │ │
 │  │                                        │ │
 │  │  ┌──────────┐ ┌────────┐ ┌─────────┐  │ │
-│  │  │ Recorder │ │ Mapper │ │ Clocked │  │ │
-│  │  │ /Buffer  │ │        │ │Sequencer│  │ │
+│  │  │ buffer/  │ │ mapper/│ │ engine/ │  │ │
+│  │  │ Ring Buf │ │ Curves │ │ Clock   │  │ │
+│  │  │          │ │ Quant  │ │ Tracks  │  │ │
 │  │  └──────────┘ └────────┘ └─────────┘  │ │
 │  └────────────────────────────────────────┘ │
 │       │                           │         │
-│  ┌────▼──────┐            ┌───────▼──────┐  │
-│  │  Sensor   │            │   Output     │  │
-│  │  Drivers  │            │   Drivers    │  │
-│  │ (HAL)     │            │   (HAL)      │  │
-│  └───────────┘            └──────────────┘  │
+│  ┌────▼──────────┐        ┌───────▼──────┐  │
+│  │ internal/input│        │internal/output│  │
+│  │               │        │              │  │
+│  │ sensor/  data-│        │ cv.go        │  │
+│  │          source/       │ midi.go      │  │
+│  │               │        │ osc.go       │  │
+│  └───────────────┘        └──────────────┘  │
 └─────────────────────────────────────────────┘
 ```
 
 ### Hardware Abstraction Layer (HAL)
 
-Abstract all input reading and output writing behind interfaces so the same sequencer engine runs on Pi, ESP32, Teensy, or in software (VST plugin). Hardware sensors and data sources implement the same `InputSource` interface:
+Hardware sensors and data sources implement the same `InputSource` interface. Output targets implement `CVOutput`, `MIDIOutput`, or `OSCOutput`.
 
+```go
+// internal/input/source.go
+
+// InputSource is the unified interface for all input streams —
+// hardware sensors and software data sources alike.
+type InputSource interface {
+    // Read returns the current normalized value (0.0 to 1.0 unipolar,
+    // or -1.0 to 1.0 bipolar).
+    Read() float64
+
+    // Subscribe registers a callback for event-driven sources
+    // (OTEL, WebSocket, MQTT, Redis SUBSCRIBE). For polled sources,
+    // the callback fires after each poll.
+    Subscribe(func(value float64, ts time.Time))
+
+    // Configure sets sample/poll rate and filtering parameters.
+    Configure(cfg SourceConfig) error
+
+    // Calibrate runs auto-range learning or zero-offset correction.
+    Calibrate(ctx context.Context) error
+
+    // Status returns the current connection state.
+    Status() ConnectionState
+
+    // Close releases resources (connections, file handles, goroutines).
+    Close() error
+}
+
+type ConnectionState int
+
+const (
+    Connected ConnectionState = iota
+    Disconnected
+    Stale    // no new data within 3x poll interval
+    Error
+)
+
+type SourceConfig struct {
+    SampleRate  float64       // Hz (hardware) or polls/sec (data source)
+    FilterType  FilterType    // MovingAvg, LowPass, None
+    FilterParam float64       // window size or cutoff frequency
+    DeadBand    float64       // ignore changes smaller than this
+    SlewLimit   float64       // max change per second (0 = unlimited)
+    RangeMin    float64       // for normalization
+    RangeMax    float64       // for normalization
+    AutoRange   bool          // learn min/max from observed values
+}
 ```
-InputSource:                            # unified interface for all inputs
-  read() -> float                       # normalized 0.0-1.0 (or -1.0 to 1.0)
-  subscribe(callback)                   # for event-driven sources (OTEL, WS, MQTT)
-  configure(sample_rate, filter)        # poll interval or sample rate
-  calibrate()                           # auto-range learning
-  status() -> ConnectionState           # connected / error / stale
 
-HardwareSensor(InputSource):            # I2C/SPI/ADC sensor implementation
-  bus_address, channel, ...
+```go
+// internal/output/cv.go
 
-DataSource(InputSource):                # network/DB data source implementation
-  endpoint, query, auth, value_path, ...
+type CVOutput interface {
+    WritePitch(channel int, voltage float64) error  // V/Oct calibrated
+    WriteMod(channel int, voltage float64) error    // raw voltage
+    WriteGate(channel int, on bool) error           // on/off
+    Close() error
+}
+```
 
-CVOutput:
-  write_pitch(channel, voltage)         # V/Oct calibrated
-  write_mod(channel, voltage)           # raw voltage
-  write_gate(channel, state)            # on/off
+```go
+// internal/output/midi.go
 
-MIDIOutput:
-  note_on(channel, note, velocity)
-  note_off(channel, note)
-  cc(channel, number, value)
-  clock()
+type MIDIOutput interface {
+    NoteOn(channel, note, velocity uint8) error
+    NoteOff(channel, note uint8) error
+    CC(channel, number, value uint8) error
+    PitchBend(channel uint8, value int16) error
+    Clock() error
+    Start() error
+    Stop() error
+    Close() error
+}
+```
+
+```go
+// internal/output/osc.go
+
+type OSCOutput interface {
+    Send(address string, args ...any) error  // e.g. "/grafophone/track1/pitch", 0.75
+    Bundle(messages []OSCMessage) error       // atomic multi-message send
+    Close() error
+}
 ```
 
 ### Real-Time Constraints
 
 | Task | Update Rate | Latency Budget | Priority |
 |---|---|---|---|
-| Gate output (trigger) | Event-driven | < 1 ms | Highest (ISR) |
+| Gate output (trigger) | Event-driven | < 1 ms | Highest (dedicated goroutine, `SCHED_FIFO`) |
 | Pitch CV update | Per step (1-1000 Hz) | < 1 ms | High |
 | Mod CV update | 1-10 kHz | < 5 ms | High |
 | Sensor reading | 1-1000 Hz (per type) | < 10 ms | Medium |
 | MIDI output | Event-driven | < 3 ms | High |
-| Display refresh | 10-30 Hz | < 50 ms | Low |
+| Data source poll | 0.1-100 Hz | < 100 ms | Medium |
+| Display / Web UI | 10-30 Hz | < 50 ms | Low |
 | Wireless comms | Async | < 100 ms | Low |
+
+**Go-specific real-time notes:**
+- Pin the CV output goroutine to an OS thread with `runtime.LockOSThread()` and set `SCHED_FIFO` via syscall for lowest jitter.
+- Use `GOGC=off` or `debug.SetGCPercent(-1)` in the hot path, with manual `runtime.GC()` calls during idle periods (between sequences) to avoid GC pauses during playback.
+- Pre-allocate all buffers. The sequencer engine hot path should be zero-allocation after initialization.
 
 ### Data Formats
 
 **Internal representation:**
-- Sensor values: 32-bit float, normalized 0.0 to 1.0 (or -1.0 to 1.0 for bipolar).
-- Pitch: MIDI note number (float, e.g., 60.0 = C4, 60.5 = C4 + 50 cents).
-- Velocity/modulation: 0.0 to 1.0 float internally, scaled to output format at the driver level.
-- Time: Tick-based (PPQ = 96 or 480 pulses per quarter note).
+- Sensor/data source values: `float64`, normalized 0.0 to 1.0 (or -1.0 to 1.0 for bipolar).
+- Pitch: MIDI note number (`float64`, e.g., 60.0 = C4, 60.5 = C4 + 50 cents).
+- Velocity/modulation: 0.0 to 1.0 `float64` internally, scaled to output format at the driver level.
+- Time: Tick-based (PPQ = 96 or 480 pulses per quarter note). `int64` tick counter.
 
-**Preset/patch storage:** JSON or MessagePack for sensor mappings, scale selections, clock settings, sequence data.
+**Preset/patch storage:** YAML for human-editable configuration files. JSON for machine interchange (web UI ↔ backend).
 
 ---
 
@@ -488,7 +654,7 @@ MIDIOutput:
 | **EuroPi** | Pi Pico | MicroPython Eurorack, CV output design | Allen-Synthesis/EuroPi |
 | **Ornament & Crime** | Teensy 3.2/4.1 | 16-bit quad CV, quantizers, sequencers | eh2k/squares-and-circles |
 | **Mutable Instruments** | STM32 | Gold standard for CV/Gate firmware, DSP | pichenettes/eurorack |
-| **CTAG Strammer** | ESP32 | Dual-core audio/CV synthesis | ctag-fh-kiel/ctag-straempler |
+| **CTAG Strämpler** | ESP32 | Dual-core audio/CV synthesis | ctag-fh-kiel/ctag-straempler |
 | **Terminal Tedium** | RPi | DC-coupled Pi audio HAT for Eurorack | mxmxmx/terminal_tedium |
 | **Zynthian** | RPi | Full Pi synth platform, PREEMPT_RT | zynthian/zynthian-sys |
 | **Marcel Licence ESP32 Synth** | ESP32 | ESP32 audio synth reference | marcel-licence/esp32_basic_synth |
@@ -497,47 +663,229 @@ MIDIOutput:
 
 ### Key Libraries
 
+**Go (core application):**
+- **periph.io** — SPI/I2C/GPIO hardware abstraction for Raspberry Pi
+- **pgx** — PostgreSQL driver (high performance, extended protocol)
+- **go-redis** — Redis client with Pub/Sub and Streams
+- **go-osc** — OSC message encoding/sending
+- **gomidi** — MIDI message encoding/decoding
+- **sarama** — Apache Kafka consumer/producer
+- **paho.mqtt.golang** — MQTT 3.1.1/5.0 client
+- **gorilla/websocket** — WebSocket client
+- **go.opentelemetry.io/collector** — OTEL collector receiver components
+- **go.opentelemetry.io/otel** — OTEL SDK for internal observability
+
+**C++ (firmware / plugin):**
+- **ESP-IDF** — Official ESP32 development framework (FreeRTOS)
+- **Teensy Audio Library** — Graphical DSP block patching for Teensy
 - **JUCE** — Cross-platform audio plugin framework (VST3/AU/CLAP)
 - **iPlug2** — Lightweight plugin framework (liberal license)
-- **clap-juce-extensions** — CLAP format support for JUCE projects
-- **DaisySP** — DSP library for Daisy/STM32 (oscillators, filters, effects)
-- **Teensy Audio Library** — Graphical DSP block patching for Teensy
-- **Circle** — Bare-metal C++ framework for Raspberry Pi
+- **DaisySP** — DSP library for Daisy/STM32
+
+**Infrastructure:**
 - **Patchbox OS** — Audio-optimized Linux distribution for Raspberry Pi
+- **Circle** — Bare-metal C++ framework for Raspberry Pi (if needed)
+
+---
+
+## CI/CD Pipeline
+
+The project uses **GitHub Actions** for all CI/CD. The pipeline enforces code quality, correctness, and produces release artifacts automatically.
+
+For detailed tool configuration and pipeline specifications, see [SPECS.md — CI/CD Pipeline Specifications](SPECS.md#cicd-pipeline-specifications).
+
+### Pipeline Stages
+
+```
+Push / PR
+    │
+    ▼
+┌─────────────────────────────────────────────┐
+│  Stage 1: Lint & Static Analysis            │
+│                                             │
+│  golangci-lint run (50+ linters)            │
+│  go vet ./...                               │
+│  govulncheck ./...                          │
+│  YAML config schema validation              │
+│  Markdown link check (DESIGN.md, SPECS.md)  │
+└──────────────────┬──────────────────────────┘
+                   │ pass
+                   ▼
+┌─────────────────────────────────────────────┐
+│  Stage 2: Unit Tests                        │
+│                                             │
+│  go test -race -coverprofile=coverage.out ./...│
+│  Coverage gate: >= 80%                      │
+│  Fuzz tests: go test -fuzz (time-limited)   │
+└──────────────────┬──────────────────────────┘
+                   │ pass
+                   ▼
+┌─────────────────────────────────────────────┐
+│  Stage 3: Build                             │
+│                                             │
+│  Build matrix:                              │
+│    linux/amd64  (dev/CI)                    │
+│    linux/arm64  (Raspberry Pi)              │
+│    linux/arm    (Pi Zero)                   │
+│    darwin/arm64 (macOS, dev)                │
+│                                             │
+│  go build -ldflags (embed version, commit)  │
+│  Upload artifacts                           │
+└──────────────────┬──────────────────────────┘
+                   │ pass
+                   ▼
+┌─────────────────────────────────────────────┐
+│  Stage 4: Integration Tests                 │
+│                                             │
+│  Docker Compose services:                   │
+│    Postgres, Redis, Prometheus, MQTT broker │
+│  go test -tags=integration ./...            │
+│  Test data source adapters against real     │
+│  services (not mocks)                       │
+└──────────────────┬──────────────────────────┘
+                   │ pass
+                   ▼
+┌─────────────────────────────────────────────┐
+│  Stage 5: Acceptance Tests                  │
+│                                             │
+│  End-to-end scenarios:                      │
+│    Config → Source → Engine → Output        │
+│  YAML config validation test suite          │
+│  MIDI output byte-level verification        │
+│  OSC output message verification            │
+│  CV output value-level verification (mock   │
+│    SPI/I2C backend)                         │
+└──────────────────┬──────────────────────────┘
+                   │ pass (main branch only)
+                   ▼
+┌─────────────────────────────────────────────┐
+│  Stage 6: Release (tag push only)           │
+│                                             │
+│  goreleaser: build, package, publish        │
+│  GitHub Release with checksums              │
+│  Container image → ghcr.io                  │
+│  CHANGELOG.md auto-generation               │
+└─────────────────────────────────────────────┘
+```
+
+### Branch Rules
+
+| Branch | Triggers | Required Checks |
+|---|---|---|
+| `main` | Push, PR | All stages (1-5). PRs require passing checks + 1 review. |
+| `feature/**` | Push, PR to main | Stages 1-4. Integration tests run on PR, not every push. |
+| `v*` (tags) | Tag push | Full pipeline + Stage 6 (release). |
+| `claude/*` | Push | Stages 1-3 (lint, test, build). |
+
+---
+
+## Build Artifacts & Release Process
+
+### Artifacts
+
+| Artifact | Format | Target | Contents |
+|---|---|---|---|
+| `grafophone-linux-amd64` | Binary (tar.gz) | Dev machines, servers | CLI binary + example configs |
+| `grafophone-linux-arm64` | Binary (tar.gz) | Raspberry Pi 3/4/5 (64-bit) | CLI binary + example configs |
+| `grafophone-linux-arm` | Binary (tar.gz) | Raspberry Pi Zero (W) / Pi 1 (32-bit) | CLI binary + example configs |
+| `grafophone-darwin-arm64` | Binary (tar.gz) | macOS (Apple Silicon) dev | CLI binary + example configs |
+| `grafophone-<version>.deb` | Debian package | Pi (apt install) | Binary + systemd unit + default config |
+| `ghcr.io/leftathome/grafophone` | OCI container image | Docker/Podman on Pi or server | Multi-arch (amd64, arm64) |
+| `grafocal-linux-arm64` | Binary (tar.gz) | Pi 3/4/5 | Standalone calibration tool (linux-only: requires hardware access) |
+| `grafocal-linux-arm` | Binary (tar.gz) | Pi Zero (W) / Pi 1 | Standalone calibration tool |
+
+### Versioning
+
+**Semantic Versioning 2.0.0** (`MAJOR.MINOR.PATCH`):
+
+| Version Component | Incremented When |
+|---|---|
+| **MAJOR** | Breaking changes to config schema, HAL interfaces, or CLI flags |
+| **MINOR** | New data source adapters, new mapping modes, new output types, new sequencer features |
+| **PATCH** | Bug fixes, calibration improvements, documentation, dependency updates |
+
+**Pre-release tags**: `v0.1.0-alpha.1`, `v0.2.0-beta.1`, `v1.0.0-rc.1`
+
+The project starts at `v0.1.0`. Semantic versioning commitments (backwards compatibility guarantees) begin at `v1.0.0`.
+
+### Version Embedding
+
+Version, commit SHA, and build date are embedded at build time via `-ldflags`:
+
+```bash
+go build -ldflags "-X main.version=v0.3.1 -X main.commit=$(git rev-parse HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+```
+
+`grafophone --version` outputs: `grafophone v0.3.1 (commit abc1234, built 2026-03-15T10:30:00Z)`
+
+### Release Process
+
+1. **Development** happens on `feature/*` or `claude/*` branches, merged to `main` via PR.
+2. **Changelog** entries are added to `CHANGELOG.md` under an `## [Unreleased]` section using [Keep a Changelog](https://keepachangelog.com/) format.
+3. **Release** is triggered by pushing a semver tag:
+   ```bash
+   git tag -a v0.3.0 -m "Release v0.3.0: Add Prometheus and Redis data sources"
+   git push origin v0.3.0
+   ```
+4. **GoReleaser** (via GitHub Actions) automatically:
+   - Builds cross-compiled binaries for all target platforms
+   - Creates `.tar.gz` archives with binary + example configs + LICENSE
+   - Builds `.deb` packages for Raspberry Pi
+   - Builds and pushes multi-arch container images to `ghcr.io`
+   - Creates a GitHub Release with changelog, checksums (`SHA256SUMS`), and attached artifacts
+   - Updates the `CHANGELOG.md` `[Unreleased]` section to the new version heading
+5. **Container images** are tagged with both the semver tag and `latest`.
+
+### GoReleaser Configuration
+
+The project uses [GoReleaser](https://goreleaser.com/) for reproducible, cross-platform release builds. Configuration lives in `.goreleaser.yml` at the repository root.
 
 ---
 
 ## Development Phases
 
-### Phase 1: Proof of Concept
-- Single sensor (IMU) → single CV output (pitch)
-- Hardcoded linear mapping, chromatic quantization
-- ESP32 + MCP4728 + op-amp output stage
-- Validate V/Oct accuracy with tuner
+### Phase 1: Foundation (`v0.1.0`)
+- Go module scaffolding, CI pipeline (lint + test + build)
+- `InputSource` and `CVOutput` interfaces
+- Ring buffer implementation with tests
+- Single data source adapter (Prometheus) → single MIDI output
+- YAML config loading and validation
+- Unit test coverage >= 80%
 
-### Phase 2: Multi-Channel Sequencer
-- 4 sensor inputs → 4 CV + 4 gate outputs
-- Configurable mapping engine with multiple curves
-- Scale quantization with selectable scales
+### Phase 2: Multi-Source Sequencer (`v0.2.0`)
+- Postgres, Redis, REST, WebSocket data source adapters
+- Mapping engine with configurable curves (linear, log, S-curve)
+- Scale quantizer with built-in scale library
 - Internal clock with division/multiplication
-- Record/playback/loop of sensor streams
-- MIDI output (USB)
+- 4-track sequencer with record/playback/loop
+- MIDI output (USB) + OSC output
+- Integration tests against real services (Docker Compose)
 
-### Phase 3: Full Platform
-- Raspberry Pi version with display UI
+### Phase 3: Hardware I/O (`v0.3.0`)
+- `periph.io` SPI/I2C drivers for DAC8568, MCP4728
+- CV/Gate output on Raspberry Pi
+- Hardware sensor drivers (IMU, environmental, distance)
+- DAC calibration routines (two-point + multi-point lookup table)
+- `.deb` package for Pi deployment
+- Acceptance test suite
+
+### Phase 4: Full Platform (`v0.4.0` → `v1.0.0`)
+- OTEL receiver (gRPC + HTTP)
+- MQTT, Kafka data source adapters
 - Euclidean rhythm generation
 - Parameter locks, probability, ratcheting
 - Multi-track polymetric sequencing
 - Preset save/load
-- WiFi/BLE wireless sensor support
+- Web UI for configuration and monitoring
+- BLE MIDI output
 - MIDI clock sync (send and receive)
 
-### Phase 4: Software Integration
-- CLAP/VST3 companion plugin
-- OSC output for software synths
-- Web-based configuration interface
+### Phase 5: Ecosystem (`v1.x`)
+- CLAP/VST3 companion plugin (C++, separate repo/build)
+- ESP32 firmware for wireless sensor nodes (C++, separate repo/build)
 - Per-VCO auto-calibration
 - MPE MIDI support
+- Grafana plugin for bidirectional integration
 
 ---
 
